@@ -5,6 +5,7 @@ import pprint
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Union
+import os
 
 import cv2
 import h5py
@@ -232,7 +233,7 @@ def main(
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"
     )
-
+  
     dataset = ImageDataset(image_dir, conf["preprocessing"], image_list)
     if feature_path is None:
         feature_path = Path(export_dir, conf["output"] + ".h5")
@@ -247,6 +248,7 @@ def main(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if  conf["model"]["name"] == "superpoint":
+        
         model = SuperPoint(max_num_keypoints=conf["model"]["max_keypoints"], nms_radius=conf["model"]["nms_radius"]).eval().to(device)  # load the extractor
         model.preprocess_conf["resize"] = conf["preprocessing"]["resize_max"]
     else:
@@ -258,9 +260,34 @@ def main(
     )
     for idx, data in enumerate(tqdm(loader)):
         name = dataset.names[idx]
-        
+        masks = {}
+        image_shape = data["image"].shape  # Assuming this is in the format [batch_size, channels, height, width]
+        image_h, image_w = image_shape[2], image_shape[3]
         if conf["model"]["name"] == "superpoint":
-            pred = model.extract(data["image"].to(device, non_blocking=True))
+            if conf["positive_mask"]["activate"] == 1:
+                positive_mask_path = os.path.join(conf["positive_mask"]["path"], name)
+                positive_mask = cv2.imread(positive_mask_path)
+                if positive_mask is None:
+                    raise FileNotFoundError(f"Failed to read the positive mask image from {positive_mask_path}")
+                positive_mask_shape = positive_mask.shape  # Assuming this is in the format [height, width, channels]
+                mask_h, mask_w = positive_mask_shape[0], positive_mask_shape[1]
+                if (image_h, image_w) != (mask_h, mask_w):
+                    raise ValueError(f"Mismatch between image and mask dimensions: Image dimensions are ({image_h}, {image_w}), but mask dimensions are ({mask_h}, {mask_w}).")
+                positive_mask = (positive_mask == conf["positive_mask"]["rgb"]).all(axis=2)
+                masks["positive_mask"] = positive_mask
+            
+            if conf["negative_mask"]["activate"] == 1:
+                negative_mask_path = os.path.join(conf["negative_mask"]["path"], name)
+                negative_mask = cv2.imread(negative_mask_path)
+                if negative_mask is None:
+                    raise FileNotFoundError(f"Failed to read the negative mask image from {negative_mask_path}")
+                negative_mask_shape = negative_mask.shape  # Assuming this is in the format [height, width, channels]
+                mask_h, mask_w = negative_mask_shape[0], negative_mask_shape[1]
+                if (image_h, image_w) != (mask_h, mask_w):
+                    raise ValueError(f"Mismatch between image and mask dimensions: Image dimensions are ({image_h}, {image_w}), but mask dimensions are ({mask_h}, {mask_w}).")
+                negative_mask = (negative_mask == conf["negative_mask"]["rgb"]).all(axis=2)
+                masks["negative_mask"] = negative_mask
+            pred = model.extract(data["image"].to(device, non_blocking=True), masks = masks)
             pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
             pred["scores"] = pred["keypoint_scores"]
             pred["descriptors"] = pred["descriptors"].T

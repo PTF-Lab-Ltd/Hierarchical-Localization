@@ -12,6 +12,7 @@ import numpy as np
 import PIL.Image
 import torch
 from tqdm import tqdm
+from lightglue import SuperPoint
 
 from . import extractors, logger
 from .utils.base_model import dynamic_load
@@ -245,26 +246,43 @@ def main(
         return feature_path
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    Model = dynamic_load(extractors, conf["model"]["name"])
-    model = Model(conf["model"]).eval().to(device)
+    if  conf["model"]["name"] == "superpoint":
+        model = SuperPoint(max_num_keypoints=conf["model"]["max_keypoints"], nms_radius=conf["model"]["nms_radius"]).eval().to(device)  # load the extractor
+        model.preprocess_conf["resize"] = conf["preprocessing"]["resize_max"]
+    else:
+        Model = dynamic_load(extractors, conf["model"]["name"])
+        model = Model(conf["model"]).eval().to(device)
 
     loader = torch.utils.data.DataLoader(
         dataset, num_workers=1, shuffle=False, pin_memory=True
     )
     for idx, data in enumerate(tqdm(loader)):
         name = dataset.names[idx]
-        pred = model({"image": data["image"].to(device, non_blocking=True)})
-        pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+        
+        if conf["model"]["name"] == "superpoint":
+            pred = model.extract(data["image"].to(device, non_blocking=True))
+            pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
+            pred["scores"] = pred["keypoint_scores"]
+            pred["descriptors"] = pred["descriptors"].T
+        else:
+            pred = model({"image": data["image"].to(device, non_blocking=True)})
+            pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
 
         pred["image_size"] = original_size = data["original_size"][0].numpy()
-        if "keypoints" in pred:
-            size = np.array(data["image"].shape[-2:][::-1])
-            scales = (original_size / size).astype(np.float32)
-            pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
-            if "scales" in pred:
-                pred["scales"] *= scales.mean()
-            # add keypoint uncertainties scaled to the original resolution
-            uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
+
+        # scales applied in the model.extract() method
+        if  conf["model"]["name"] != "superpoint":
+            if "keypoints" in pred:
+                size = np.array(data["image"].shape[-2:][::-1])
+                scales = (original_size / size).astype(np.float32)
+                pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
+                if "scales" in pred:
+                    pred["scales"] *= scales.mean()
+                # add keypoint uncertainties scaled to the original resolution
+
+        size = np.array(data["image"].shape[-2:][::-1])
+        scales = (original_size / size).astype(np.float32)
+        uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
 
         if as_half:
             for k in pred:
